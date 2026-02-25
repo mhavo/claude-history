@@ -472,6 +472,12 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
     let visible_height = area.height as usize;
     let query_lower = state.search_query.to_lowercase();
 
+    // Determine the current message line range for the visual indicator
+    let current_msg_range = state
+        .message_boundaries
+        .get(state.current_message)
+        .map(|b| (b.start_line, b.end_line));
+
     let visible_lines: Vec<Line> = state
         .rendered_lines
         .iter()
@@ -482,7 +488,10 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
             let is_current_match = state.search_matches.get(state.current_match) == Some(&line_idx);
             let has_match = !query_lower.is_empty() && state.search_matches.contains(&line_idx);
 
-            let spans: Vec<Span> = if has_match && !query_lower.is_empty() {
+            let in_current_message = current_msg_range
+                .is_some_and(|(start, end)| line_idx >= start && line_idx < end);
+
+            let mut spans: Vec<Span> = if has_match && !query_lower.is_empty() {
                 highlight_line_matches(rendered, &query_lower, is_current_match)
             } else {
                 rendered
@@ -491,6 +500,16 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
                     .map(|(text, style)| styled_span(text, style))
                     .collect()
             };
+
+            // Prepend a subtle marker for the current message
+            if in_current_message {
+                spans.insert(
+                    0,
+                    Span::styled("▌", Style::default().fg(Color::Rgb(60, 160, 140))),
+                );
+            } else {
+                spans.insert(0, Span::raw(" "));
+            }
 
             Line::from(spans)
         })
@@ -892,7 +911,9 @@ fn render_help_overlay(frame: &mut Frame, is_view_mode: bool, is_single_file_mod
             ("T", "Toggle thinking"),
             ("i", "Toggle timing"),
             ("e", "Export to file"),
+            ("c", "Copy current message"),
             ("y", "Copy to clipboard"),
+            ("J / K", "Next / prev message"),
             ("p", "Show file path"),
             ("Y", "Copy path"),
             ("I", "Copy session ID"),
