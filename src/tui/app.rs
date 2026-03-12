@@ -6,7 +6,7 @@ use crate::history::{
 };
 use crate::tui::search::{self, SearchableConversation};
 use crate::tui::ui;
-use crate::tui::viewer::ToolDisplayMode;
+use crate::tui::viewer::{MessageBoundary, ToolDisplayMode};
 use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -84,6 +84,19 @@ pub struct ViewState {
     pub search_matches: Vec<usize>,
     /// Current match index
     pub current_match: usize,
+    /// Message boundaries mapping line ranges to messages
+    pub message_boundaries: Vec<MessageBoundary>,
+    /// Index of the currently focused message in message_boundaries
+    pub current_message: usize,
+}
+
+impl ViewState {
+    /// Find which message boundary contains the given line index
+    pub fn message_at_line(&self, line: usize) -> Option<usize> {
+        self.message_boundaries
+            .iter()
+            .position(|b| line >= b.start_line && line < b.end_line)
+    }
 }
 
 /// Search mode within view
@@ -265,6 +278,8 @@ impl App {
                 search_query: String::new(),
                 search_matches: Vec::new(),
                 current_match: 0,
+                message_boundaries: Vec::new(),
+                current_message: 0,
             }),
             status_message: None,
             tool_display,
@@ -749,7 +764,11 @@ impl App {
 
         // Delegate based on app mode
         match &self.app_mode {
-            AppMode::View(_) => self.handle_view_key(code, modifiers, viewport_height),
+            AppMode::View(_) => {
+                let result = self.handle_view_key(code, modifiers, viewport_height);
+                self.sync_current_message();
+                result
+            }
             AppMode::List => self.handle_list_key(code, modifiers, viewport_height),
         }
     }
@@ -935,7 +954,7 @@ impl App {
             KeyCode::Char('Y') => {
                 if let AppMode::View(ref state) = self.app_mode {
                     let path_str = state.conversation_path.display().to_string();
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&path_str)) {
+                    match crate::tui::export::copy_to_system_clipboard(&path_str) {
                         Ok(()) => {
                             self.status_message = Some((
                                 "Path copied to clipboard".to_string(),
@@ -944,7 +963,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_message = Some((
-                                format!("Clipboard error: {}", e),
+                                e,
                                 std::time::Instant::now(),
                             ));
                         }
@@ -958,7 +977,7 @@ impl App {
                 if let AppMode::View(ref state) = self.app_mode
                     && let Some(id) = state.conversation_path.file_stem().and_then(|s| s.to_str())
                 {
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(id)) {
+                    match crate::tui::export::copy_to_system_clipboard(id) {
                         Ok(()) => {
                             self.status_message = Some((
                                 "Session ID copied to clipboard".to_string(),
@@ -967,7 +986,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_message = Some((
-                                format!("Clipboard error: {}", e),
+                                e,
                                 std::time::Instant::now(),
                             ));
                         }
@@ -985,6 +1004,48 @@ impl App {
             // Open yank menu (copy to clipboard)
             KeyCode::Char('y') => {
                 self.dialog_mode = DialogMode::YankMenu { selected: 0 };
+                None
+            }
+
+            // Copy current message to clipboard
+            KeyCode::Char('c') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                if let AppMode::View(ref state) = self.app_mode
+                    && let Some(boundary) = state.message_boundaries.get(state.current_message)
+                {
+                    let result = crate::tui::export::yank_single_message(
+                        &state.conversation_path,
+                        boundary.entry_index,
+                        crate::tui::export::ExportOptions {
+                            show_tools: state.tool_display.is_visible(),
+                            show_thinking: state.show_thinking,
+                        },
+                    );
+                    self.status_message = Some((result.message, std::time::Instant::now()));
+                }
+                None
+            }
+
+            // Jump to previous message
+            KeyCode::Char('K') => {
+                if let AppMode::View(ref mut state) = self.app_mode
+                    && state.current_message > 0
+                {
+                    state.current_message -= 1;
+                    state.scroll_offset =
+                        state.message_boundaries[state.current_message].start_line;
+                }
+                None
+            }
+
+            // Jump to next message
+            KeyCode::Char('J') => {
+                if let AppMode::View(ref mut state) = self.app_mode
+                    && state.current_message + 1 < state.message_boundaries.len()
+                {
+                    state.current_message += 1;
+                    state.scroll_offset =
+                        state.message_boundaries[state.current_message].start_line;
+                }
                 None
             }
 
@@ -1295,12 +1356,12 @@ impl App {
         };
 
         match render_conversation(&path, &options) {
-            Ok(rendered_lines) => {
-                let total_lines = rendered_lines.len();
+            Ok(result) => {
+                let total_lines = result.lines.len();
                 self.app_mode = AppMode::View(ViewState {
                     conversation_path: path,
                     scroll_offset: 0,
-                    rendered_lines,
+                    rendered_lines: result.lines,
                     total_lines,
                     tool_display: self.tool_display,
                     show_thinking: self.show_thinking,
@@ -1310,6 +1371,8 @@ impl App {
                     search_query: String::new(),
                     search_matches: Vec::new(),
                     current_match: 0,
+                    message_boundaries: result.message_boundaries,
+                    current_message: 0,
                 });
             }
             Err(e) => {
@@ -1435,10 +1498,11 @@ impl App {
                 content_width: state.content_width,
             };
 
-            if let Ok(lines) = render_conversation(&state.conversation_path, &options) {
+            if let Ok(result) = render_conversation(&state.conversation_path, &options) {
                 let old_scroll = state.scroll_offset;
-                state.total_lines = lines.len();
-                state.rendered_lines = lines;
+                state.total_lines = result.lines.len();
+                state.rendered_lines = result.lines;
+                state.message_boundaries = result.message_boundaries;
 
                 // Clamp scroll offset to new content bounds
                 let max_scroll = state.total_lines.saturating_sub(viewport_height);
@@ -1463,7 +1527,21 @@ impl App {
                             state.current_match.min(state.search_matches.len() - 1);
                     }
                 }
+
+                // Sync current message after re-render
+                if let Some(idx) = state.message_at_line(state.scroll_offset) {
+                    state.current_message = idx;
+                }
             }
+        }
+    }
+
+    /// Update current_message based on current scroll_offset
+    fn sync_current_message(&mut self) {
+        if let AppMode::View(ref mut state) = self.app_mode
+            && let Some(idx) = state.message_at_line(state.scroll_offset)
+        {
+            state.current_message = idx;
         }
     }
 
